@@ -1,0 +1,10 @@
+[package]
+name = "rtsp-camera-driver-rgb"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+make87 = "0.0.36"
+make87_messages = "0.2.4"
+anyhow = "1.0.98"
+ffmpeg-sidecar = "2.0.5"
