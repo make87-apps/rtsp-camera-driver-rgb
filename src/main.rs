@@ -37,7 +37,7 @@ fn spawn_ffmpeg_reader(rtsp_url: &str, latest: LatestFrame) -> Result<()> {
                     }),
                     width: frame.width,
                     height: frame.height,
-                    data: frame.data, // Assuming the data is already in RGBA format
+                    data: frame.data, // Data is in RGB888 format: [R, G, B, R, G, B, ...]
                 };
 
                 // Atomically replace the previous frame.
