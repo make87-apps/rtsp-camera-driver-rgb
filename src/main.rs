@@ -31,7 +31,7 @@ fn format_entity_path(rtsp_url: &str) -> String {
 }
 
 /// Spawns a blocking thread to run FFmpeg and decode RGB888 frames.
-async fn spawn_ffmpeg_reader(rtsp_url: &str, sender: FrameSender) -> Result<()> {
+async fn spawn_ffmpeg_reader(rtsp_url: &str, stream_index: u32, sender: FrameSender) -> Result<()> {
     let rtsp_url = rtsp_url.to_owned();
     let entity_path = format_entity_path(&rtsp_url);
 
@@ -50,6 +50,9 @@ async fn spawn_ffmpeg_reader(rtsp_url: &str, sender: FrameSender) -> Result<()> 
 
         if let Ok(iter) = child.iter() {
             for frame in iter.filter_frames() {
+                if frame.output_index != stream_index {
+                    continue;
+                }
                 let timestamp = Timestamp::get_current_time().into();
 
                 let rgb_image = ImageRgb888 {
@@ -139,7 +142,7 @@ async fn main() -> Result<()> {
 
     let (sender, receiver) = watch::channel(None);
 
-    spawn_ffmpeg_reader(&rtsp_url, sender).await?;
+    spawn_ffmpeg_reader(&rtsp_url, config.stream_index, sender).await?;
     publish_frames(receiver).await?;
 
     Ok(())
