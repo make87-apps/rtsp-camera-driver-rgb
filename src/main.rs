@@ -1,48 +1,61 @@
 use anyhow::Result;
-use ffmpeg_sidecar::{command::FfmpegCommand}; // `IterExt` gives us `.filter_frames()`
-use std::{
-    sync::{Arc, Mutex},
-    thread,
-    time::Duration,
-};
-use make87_messages::image::uncompressed::ImageRgb888;
+use ffmpeg_sidecar::command::FfmpegCommand;
 use make87_messages::core::Header;
 use make87_messages::google::protobuf::Timestamp;
-use make87;
+use make87_messages::image::uncompressed::ImageRgb888;
+use tokio::sync::watch;
+use tokio::task;
+use url::Url;
 
-type LatestFrame = Arc<Mutex<Option<ImageRgb888>>>;
+type FrameSender = watch::Sender<Option<ImageRgb888>>;
+type FrameReceiver = watch::Receiver<Option<ImageRgb888>>;
 
-fn spawn_ffmpeg_reader(rtsp_url: &str, latest: LatestFrame) -> Result<()> {
-    // Build the command --------------------------------------------
-    let mut child = FfmpegCommand::new()
-        // .args(["-fflags", "nobuffer"])              // minimise internal buffering
-        .args(["-rtsp_transport", "tcp"])            // reliable transport
-        .input(rtsp_url)                             // RTSP source  :contentReference[oaicite:0]{index=0}
-        .arg("-vsync")
-        .arg("0")                                    // no duplicate / drop – pass through
-        .rawvideo()                                  // -f rawvideo -pix_fmt rgb24 -  :contentReference[oaicite:1]{index=1}
-        .spawn()?;
+/// Parses the RTSP URL into `/camera/<ip>/<path>`
+fn format_entity_path(rtsp_url: &str) -> String {
+    if let Ok(parsed) = Url::parse(rtsp_url) {
+        let ip = parsed.host_str().unwrap_or("unknown");
+        let path = parsed.path().trim_start_matches('/'); // remove leading slash
+        format!("/camera/{}/{}", ip, path)
+    } else {
+        "/camera/unknown".to_string()
+    }
+}
 
-    // Iterate over decoded frames -------------------------------
-    thread::spawn(move || {
-        // The iterator yields log events *and* frames – the
-        // extension trait gives us a convenient `.filter_frames()`.
+/// Spawns a blocking thread to run FFmpeg and decode RGB888 frames.
+async fn spawn_ffmpeg_reader(rtsp_url: &str, sender: FrameSender) -> Result<()> {
+    let rtsp_url = rtsp_url.to_owned();
+    let entity_path = format_entity_path(&rtsp_url);
+
+    task::spawn_blocking(move || {
+        let mut child = FfmpegCommand::new()
+            .args(["-rtsp_transport", "tcp"])
+            .input(&rtsp_url)
+            .arg("-vsync")
+            .arg("0")
+            .rawvideo()
+            .spawn()
+            .expect("Failed to spawn ffmpeg");
+
         if let Ok(iter) = child.iter() {
-            for frame in iter.filter_frames() {      //  :contentReference[oaicite:2]{index=2}
+            for frame in iter.filter_frames() {
+                let timestamp = Timestamp::get_current_time().into();
+
+
                 let rgb_image = ImageRgb888 {
                     header: Some(Header {
-                        timestamp: Timestamp::get_current_time().into(),
+                        timestamp: Some(timestamp),
                         reference_id: 0,
-                        entity_path: "/camera".to_string(),
+                        entity_path: entity_path.clone(),
                     }),
                     width: frame.width,
                     height: frame.height,
-                    data: frame.data, // Data is in RGB888 format: [R, G, B, R, G, B, ...]
+                    data: frame.data,
                 };
 
-                // Atomically replace the previous frame.
-                let mut slot = latest.lock().unwrap();
-                *slot = Some(rgb_image);
+                if sender.send(Some(rgb_image)).is_err() {
+                    eprintln!("Channel closed, stopping reader thread");
+                    break;
+                }
 
                 println!("Received frame: {}x{}", frame.width, frame.height);
             }
@@ -52,37 +65,35 @@ fn spawn_ffmpeg_reader(rtsp_url: &str, latest: LatestFrame) -> Result<()> {
     Ok(())
 }
 
-fn take_latest(latest: &LatestFrame) -> Option<ImageRgb888> {
-    latest.lock().unwrap().take()
-}
-
-fn main() -> Result<()> {
-    make87::initialize();
-
-    let rtsp_url = "rtsp://your_rtsp_stream_url"; // Replace with your RTSP URL
-
-    // Shared frame slot
-    let latest: LatestFrame = Arc::new(Mutex::new(None));
-
-    // Kick off background reader
-    spawn_ffmpeg_reader(rtsp_url, Arc::clone(&latest))?;
-
-    let topic_name = "OUTGOING_FRAME";
+/// Consumes new frames from the receiver and publishes them asynchronously.
+async fn publish_frames(mut receiver: FrameReceiver, topic_name: &str) -> Result<()> {
     let publisher = make87::resolve_topic_name(topic_name)
         .and_then(|resolved| make87::get_publisher::<ImageRgb888>(resolved))
         .expect("Failed to resolve or create publisher");
 
-    // Poll & publish
     loop {
-        if let Some(image) = take_latest(&latest) {
-            match publisher.publish(&image) {
-                Ok(()) => println!("Published frame: {}x{}", image.width, image.height),
-                Err(_) => eprintln!("Failed to publish frame"),
+        receiver.changed().await?;
+        if let Some(image) = receiver.borrow().clone() {
+            if let Err(e) = publisher.publish_async(&image).await {
+                eprintln!("Failed to publish frame: {e}");
+            } else {
+                println!("Published frame: {}x{}", image.width, image.height);
             }
-        } else {
-            thread::sleep(Duration::from_millis(5));
         }
     }
 }
 
+#[tokio::main]
+async fn main() -> Result<()> {
+    make87::initialize();
 
+    let rtsp_url = "rtsp://your_rtsp_stream_url";
+    let topic_name = "CAMERA_RGB";
+
+    let (sender, receiver) = watch::channel(None);
+
+    spawn_ffmpeg_reader(rtsp_url, sender).await?;
+    publish_frames(receiver, topic_name).await?;
+
+    Ok(())
+}

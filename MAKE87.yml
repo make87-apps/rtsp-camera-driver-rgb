@@ -1,6 +1,6 @@
 build_kit:
-  name: python3
+  name: rust_av
   version: latest
 outbound_topics:
-  - name: HELLO_WORLD_MESSAGE
-    message_type: make87_messages.text.text_plain.PlainText
+  - name: CAMERA_RGB
+    message_type: make87_messages.image.uncompressed.image_rgb888.ImageRGB888
