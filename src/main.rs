@@ -10,6 +10,15 @@ use url::Url;
 type FrameSender = watch::Sender<Option<ImageRgb888>>;
 type FrameReceiver = watch::Receiver<Option<ImageRgb888>>;
 
+struct CameraConfig {
+    ip: String,
+    port: u32,
+    uri_suffix: String,
+    username: String,
+    password: String,
+    stream_index: u32,
+}
+
 /// Parses the RTSP URL into `/camera/<ip>/<path>`
 fn format_entity_path(rtsp_url: &str) -> String {
     if let Ok(parsed) = Url::parse(rtsp_url) {
@@ -28,7 +37,10 @@ async fn spawn_ffmpeg_reader(rtsp_url: &str, sender: FrameSender) -> Result<()> 
 
     task::spawn_blocking(move || {
         let mut child = FfmpegCommand::new()
-            .args(["-rtsp_transport", "tcp"])
+            .args([
+                "-rtsp_transport",
+                "tcp",
+            ])
             .input(&rtsp_url)
             .arg("-vsync")
             .arg("0")
@@ -39,7 +51,6 @@ async fn spawn_ffmpeg_reader(rtsp_url: &str, sender: FrameSender) -> Result<()> 
         if let Ok(iter) = child.iter() {
             for frame in iter.filter_frames() {
                 let timestamp = Timestamp::get_current_time().into();
-
 
                 let rgb_image = ImageRgb888 {
                     header: Some(Header {
@@ -57,7 +68,10 @@ async fn spawn_ffmpeg_reader(rtsp_url: &str, sender: FrameSender) -> Result<()> 
                     break;
                 }
 
-                println!("Received frame: {}x{}", frame.width, frame.height);
+                println!(
+                    "Received frame: {}x{}@{}",
+                    frame.width, frame.height, frame.timestamp
+                );
             }
         }
     });
@@ -66,8 +80,8 @@ async fn spawn_ffmpeg_reader(rtsp_url: &str, sender: FrameSender) -> Result<()> 
 }
 
 /// Consumes new frames from the receiver and publishes them asynchronously.
-async fn publish_frames(mut receiver: FrameReceiver, topic_name: &str) -> Result<()> {
-    let publisher = make87::resolve_topic_name(topic_name)
+async fn publish_frames(mut receiver: FrameReceiver) -> Result<()> {
+    let publisher = make87::resolve_topic_name("CAMERA_RGB")
         .and_then(|resolved| make87::get_publisher::<ImageRgb888>(resolved))
         .expect("Failed to resolve or create publisher");
 
@@ -76,24 +90,57 @@ async fn publish_frames(mut receiver: FrameReceiver, topic_name: &str) -> Result
         if let Some(image) = receiver.borrow().clone() {
             if let Err(e) = publisher.publish_async(&image).await {
                 eprintln!("Failed to publish frame: {e}");
-            } else {
-                println!("Published frame: {}x{}", image.width, image.height);
             }
         }
     }
+}
+
+fn load_camera_config() -> Result<CameraConfig, anyhow::Error> {
+    let username = make87::get_config_value("CAMERA_USERNAME")
+        .ok_or_else(|| anyhow::anyhow!("CAMERA_USERNAME is required"))?;
+    let password = make87::get_config_value("CAMERA_PASSWORD")
+        .ok_or_else(|| anyhow::anyhow!("CAMERA_PASSWORD is required"))?;
+    let ip = make87::get_config_value("CAMERA_IP")
+        .ok_or_else(|| anyhow::anyhow!("CAMERA_IP is required"))?;
+
+    let port = make87::get_config_value("CAMERA_PORT").unwrap_or_else(|| "554".to_string()).parse::<u32>().map_err(|e| anyhow::anyhow!("STREAM_INDEX must be a valid u32: {}", e))?;
+    let uri_suffix = make87::get_config_value("CAMERA_URI_SUFFIX").unwrap_or_default();
+    let stream_index = make87::get_config_value("STREAM_INDEX")
+        .unwrap_or_else(|| "0".to_string())
+        .parse::<u32>()
+        .map_err(|e| anyhow::anyhow!("STREAM_INDEX must be a valid u32: {}", e))?;
+
+    Ok(CameraConfig {
+        username,
+        password,
+        ip,
+        port,
+        uri_suffix,
+        stream_index,
+    })
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     make87::initialize();
 
-    let rtsp_url = "rtsp://your_rtsp_stream_url";
-    let topic_name = "CAMERA_RGB";
+
+    let config = load_camera_config()?;
+
+
+    let rtsp_url = format!(
+        "rtsp://{}:{}@{}:{}/{}",
+        config.username,
+        config.password,
+        config.ip,
+        config.port,
+        config.uri_suffix
+    );
 
     let (sender, receiver) = watch::channel(None);
 
-    spawn_ffmpeg_reader(rtsp_url, sender).await?;
-    publish_frames(receiver, topic_name).await?;
+    spawn_ffmpeg_reader(&rtsp_url, sender).await?;
+    publish_frames(receiver).await?;
 
     Ok(())
 }
