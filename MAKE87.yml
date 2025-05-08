@@ -1,6 +1,7 @@
 build_kit:
   name: file://build_kit/Dockerfile
   version: latest
+  target_architectures: [amd64]
 outbound_topics:
   - name: CAMERA_RGB
     message_type: make87_messages.image.uncompressed.image_rgb888.ImageRGB888
