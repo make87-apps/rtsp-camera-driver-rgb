@@ -39,8 +39,9 @@ async fn spawn_ffmpeg_reader(rtsp_url: &str, stream_index: u32, sender: FrameSen
     task::spawn_blocking(move || {
         let mut child = FfmpegCommand::new()
             .args([
-                "-rtsp_transport",
-                "tcp",
+                "-rtsp_transport", "tcp",
+                "-timeout", "5000000",        // 5 s read‑timeout
+                "-allowed_media_types", "video",
             ])
             .input(&rtsp_url)
             .fps_mode("passthrough")
@@ -127,36 +128,6 @@ async fn spawn_ffmpeg_reader(rtsp_url: &str, stream_index: u32, sender: FrameSen
                     }
                 }
             }
-
-
-
-            // for frame in iter.filter_frames() {
-            //     if frame.output_index != stream_index {
-            //         continue;
-            //     }
-            //     let timestamp = Timestamp::get_current_time().into();
-            //
-            //     let rgb_image = ImageRgb888 {
-            //         header: Some(Header {
-            //             timestamp: Some(timestamp),
-            //             reference_id: 0,
-            //             entity_path: entity_path.clone(),
-            //         }),
-            //         width: frame.width,
-            //         height: frame.height,
-            //         data: frame.data,
-            //     };
-            //
-            //     if sender.send(Some(rgb_image)).is_err() {
-            //         eprintln!("Channel closed, stopping reader thread");
-            //         break;
-            //     }
-            //
-            //     println!(
-            //         "Received frame: {}x{}@{}",
-            //         frame.width, frame.height, frame.timestamp
-            //     );
-            // }
         }
     });
 
