@@ -1,5 +1,6 @@
 use anyhow::Result;
 use ffmpeg_sidecar::command::FfmpegCommand;
+use ffmpeg_sidecar::event::FfmpegEvent;
 use make87_messages::core::Header;
 use make87_messages::google::protobuf::Timestamp;
 use make87_messages::image::uncompressed::ImageRgb888;
@@ -37,46 +38,125 @@ async fn spawn_ffmpeg_reader(rtsp_url: &str, stream_index: u32, sender: FrameSen
 
     task::spawn_blocking(move || {
         let mut child = FfmpegCommand::new()
-            .hwaccel("vaapi")
             .args([
                 "-rtsp_transport",
                 "tcp",
             ])
             .input(&rtsp_url)
-            .arg("-vsync")
-            .arg("0")
+            .fps_mode("passthrough")
             .rawvideo()
             .spawn()
             .expect("Failed to spawn ffmpeg");
 
         if let Ok(iter) = child.iter() {
-            for frame in iter.filter_frames() {
-                if frame.output_index != stream_index {
-                    continue;
+            for event in iter {
+                match event {
+                    FfmpegEvent::ParsedVersion(v) => {
+                        println!("Parsed FFmpeg version: {:?}", v);
+                    }
+                    FfmpegEvent::ParsedConfiguration(c) => {
+                        println!("Parsed FFmpeg configuration: {:?}", c);
+                    }
+                    FfmpegEvent::ParsedStreamMapping(mapping) => {
+                        println!("Parsed stream mapping: {}", mapping);
+                    }
+                    FfmpegEvent::ParsedInput(input) => {
+                        println!("Parsed input: {:?}", input);
+                    }
+                    FfmpegEvent::ParsedOutput(output) => {
+                        println!("Parsed output: {:?}", output);
+                    }
+                    FfmpegEvent::ParsedInputStream(stream) => {
+                        println!("Parsed input stream: {:?}", stream);
+                    }
+                    FfmpegEvent::ParsedOutputStream(stream) => {
+                        println!("Parsed output stream: {:?}", stream);
+                    }
+                    FfmpegEvent::ParsedDuration(duration) => {
+                        println!("Parsed duration: {:?}", duration);
+                    }
+                    FfmpegEvent::Log(level, msg) => {
+                        println!("FFmpeg log [{:?}]: {}", level, msg);
+                    }
+                    FfmpegEvent::LogEOF => {
+                        println!("FFmpeg log ended");
+                    }
+                    FfmpegEvent::Error(err) => {
+                        eprintln!("Error: {}", err);
+                    }
+                    FfmpegEvent::Progress(progress) => {
+                        println!("Progress: {:?}", progress);
+                    }
+                    FfmpegEvent::OutputFrame(frame) => {
+                        if frame.output_index != stream_index {
+                            continue;
+                        }
+
+                        println!(
+                            "Received output frame: {}x{}, fmt={}, index={}, ts={}",
+                            frame.width,
+                            frame.height,
+                            frame.pix_fmt,
+                            frame.output_index,
+                            frame.timestamp
+                        );
+
+                        let timestamp = Timestamp::get_current_time().into();
+
+                        let rgb_image = ImageRgb888 {
+                            header: Some(Header {
+                                timestamp: Some(timestamp),
+                                reference_id: 0,
+                                entity_path: entity_path.clone(),
+                            }),
+                            width: frame.width,
+                            height: frame.height,
+                            data: frame.data,
+                        };
+
+                        if sender.send(Some(rgb_image)).is_err() {
+                            eprintln!("Channel closed, stopping reader thread");
+                            break;
+                        }
+                    }
+                    FfmpegEvent::OutputChunk(chunk) => {
+                        println!("Received output chunk ({} bytes)", chunk.len());
+                    }
+                    FfmpegEvent::Done => {
+                        println!("FFmpeg processing done");
+                    }
                 }
-                let timestamp = Timestamp::get_current_time().into();
-
-                let rgb_image = ImageRgb888 {
-                    header: Some(Header {
-                        timestamp: Some(timestamp),
-                        reference_id: 0,
-                        entity_path: entity_path.clone(),
-                    }),
-                    width: frame.width,
-                    height: frame.height,
-                    data: frame.data,
-                };
-
-                if sender.send(Some(rgb_image)).is_err() {
-                    eprintln!("Channel closed, stopping reader thread");
-                    break;
-                }
-
-                println!(
-                    "Received frame: {}x{}@{}",
-                    frame.width, frame.height, frame.timestamp
-                );
             }
+
+
+
+            // for frame in iter.filter_frames() {
+            //     if frame.output_index != stream_index {
+            //         continue;
+            //     }
+            //     let timestamp = Timestamp::get_current_time().into();
+            //
+            //     let rgb_image = ImageRgb888 {
+            //         header: Some(Header {
+            //             timestamp: Some(timestamp),
+            //             reference_id: 0,
+            //             entity_path: entity_path.clone(),
+            //         }),
+            //         width: frame.width,
+            //         height: frame.height,
+            //         data: frame.data,
+            //     };
+            //
+            //     if sender.send(Some(rgb_image)).is_err() {
+            //         eprintln!("Channel closed, stopping reader thread");
+            //         break;
+            //     }
+            //
+            //     println!(
+            //         "Received frame: {}x{}@{}",
+            //         frame.width, frame.height, frame.timestamp
+            //     );
+            // }
         }
     });
 
