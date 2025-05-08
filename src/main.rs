@@ -31,59 +31,56 @@ fn format_entity_path(rtsp_url: &str) -> String {
 }
 
 /// Spawns a blocking thread to run FFmpeg and decode RGB888 frames.
-async fn spawn_ffmpeg_reader(rtsp_url: &str,
-                             stream_index: u32,
-                             sender: FrameSender) -> Result<()> {
-    let rtsp_url   = rtsp_url.to_owned();
-    let entity     = format_entity_path(&rtsp_url);
+async fn spawn_ffmpeg_reader(rtsp_url: &str, stream_index: u32, sender: FrameSender) -> Result<()> {
+    let rtsp_url = rtsp_url.to_owned();
+    let entity_path = format_entity_path(&rtsp_url);
 
     task::spawn_blocking(move || {
-        loop {
-            // 1. Start (or restart) ffmpeg
-            let mut child = FfmpegCommand::new()
-                .args([
-                    "-loglevel", "error",   // discard chatty stderr
-                    "-rtsp_transport", "tcp",
-                    "-stimeout", "5000000", // 5s read‑timeout
-                ])
-                .input(&rtsp_url)
-                .arg("-vsync").arg("0")
-                .rawvideo()
-                .spawn()
-                .expect("failed to spawn ffmpeg");
+        let mut child = FfmpegCommand::new()
+            .args([
+                "-rtsp_transport",
+                "tcp",
+            ])
+            .input(&rtsp_url)
+            .arg("-vsync")
+            .arg("0")
+            .rawvideo()
+            .spawn()
+            .expect("Failed to spawn ffmpeg");
 
-            // ────── HERE is the iterator ──────
-            if let Ok(iter) = child.iter() {
-                for frame in iter.filter_frames() {
-                    if frame.output_index != stream_index {
-                        continue;
-                    }
-                    let rgb = ImageRgb888 {
-                        header: Some(Header {
-                            timestamp: Some(Timestamp::get_current_time().into()),
-                            reference_id: 0,
-                            entity_path: entity.clone(),
-                        }),
-                        width:  frame.width,
-                        height: frame.height,
-                        data:   frame.data,
-                    };
-                    if sender.send(Some(rgb)).is_err() {
-                        eprintln!("channel closed – stopping ffmpeg loop");
-                        return;
-                    }
+        if let Ok(iter) = child.iter() {
+            for frame in iter.filter_frames() {
+                if frame.output_index != stream_index {
+                    continue;
                 }
-            }
+                let timestamp = Timestamp::get_current_time().into();
 
-            // 2. The iterator finished ⇒ ffmpeg died or stalled.
-            eprintln!("ffmpeg stalled/exited – restarting in 2s …");
-            std::thread::sleep(std::time::Duration::from_secs(2));
+                let rgb_image = ImageRgb888 {
+                    header: Some(Header {
+                        timestamp: Some(timestamp),
+                        reference_id: 0,
+                        entity_path: entity_path.clone(),
+                    }),
+                    width: frame.width,
+                    height: frame.height,
+                    data: frame.data,
+                };
+
+                if sender.send(Some(rgb_image)).is_err() {
+                    eprintln!("Channel closed, stopping reader thread");
+                    break;
+                }
+
+                println!(
+                    "Received frame: {}x{}@{}",
+                    frame.width, frame.height, frame.timestamp
+                );
+            }
         }
     });
 
     Ok(())
 }
-
 
 /// Consumes new frames from the receiver and publishes them asynchronously.
 async fn publish_frames(mut receiver: FrameReceiver) -> Result<()> {
