@@ -1,5 +1,5 @@
 build_kit:
-  name: rust_av
+  name: file://build_kit/Dockerfile
   version: latest
 outbound_topics:
   - name: CAMERA_RGB
@@ -28,3 +28,12 @@ config:
     - name: STREAM_INDEX
       description: "Index of the stream to use. Will raise an error if the index is out of range."
       default: "0"
+peripheral_requirements:
+  - name: RENDER
+    peripheral_type: GenericDevice
+    constraints:
+      type: GenericDevice
+      path_prefix: "/dev/dri/renderD"
+      path_suffix: null
+      contains: null
+      contains_not: null

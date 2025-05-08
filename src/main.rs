@@ -37,6 +37,7 @@ async fn spawn_ffmpeg_reader(rtsp_url: &str, stream_index: u32, sender: FrameSen
 
     task::spawn_blocking(move || {
         let mut child = FfmpegCommand::new()
+            .hwaccel("vaapi")
             .args([
                 "-rtsp_transport",
                 "tcp",
