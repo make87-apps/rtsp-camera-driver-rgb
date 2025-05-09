@@ -1,23 +1,25 @@
 use anyhow::Result;
 use ffmpeg_sidecar::command::FfmpegCommand;
 use ffmpeg_sidecar::event::FfmpegEvent;
+use futures::stream::{StreamExt, SelectAll};
 use make87_messages::core::Header;
 use make87_messages::google::protobuf::Timestamp;
 use make87_messages::image::uncompressed::ImageRgb888;
 use tokio::sync::watch;
 use tokio::task;
+use tokio_stream::wrappers::WatchStream;
 use url::Url;
 
 type FrameSender = watch::Sender<Option<ImageRgb888>>;
 type FrameReceiver = watch::Receiver<Option<ImageRgb888>>;
 
 struct CameraConfig {
-    ip: String,
-    port: u32,
-    uri_suffix: String,
-    username: String,
-    password: String,
-    stream_index: u32,
+    ip: Vec<String>,
+    port: Vec<u32>,
+    uri_suffix: Vec<String>,
+    username: Vec<String>,
+    password: Vec<String>,
+    stream_index: Vec<u32>,
 }
 
 /// Parses the RTSP URL into `/camera/<ip>/<path>`
@@ -32,8 +34,7 @@ fn format_entity_path(rtsp_url: &str) -> String {
 }
 
 /// Spawns a blocking thread to run FFmpeg and decode RGB888 frames.
-async fn spawn_ffmpeg_reader(rtsp_url: &str, stream_index: u32, sender: FrameSender) -> Result<()> {
-    let rtsp_url = rtsp_url.to_owned();
+async fn spawn_ffmpeg_reader(rtsp_url: String, stream_index: u32, sender: FrameSender, camera_idx: usize) -> Result<()> {
     let entity_path = format_entity_path(&rtsp_url);
 
     task::spawn_blocking(move || {
@@ -47,46 +48,46 @@ async fn spawn_ffmpeg_reader(rtsp_url: &str, stream_index: u32, sender: FrameSen
             .fps_mode("passthrough")
             .rawvideo()
             .spawn()
-            .expect("Failed to spawn ffmpeg");
+            .expect(&format!("Failed to spawn ffmpeg (camera {camera_idx})"));
 
         if let Ok(iter) = child.iter() {
             for event in iter {
                 match event {
                     FfmpegEvent::ParsedVersion(v) => {
-                        println!("Parsed FFmpeg version: {:?}", v);
+                        println!("[camera {camera_idx}] Parsed FFmpeg version: {:?}", v);
                     }
                     FfmpegEvent::ParsedConfiguration(c) => {
-                        println!("Parsed FFmpeg configuration: {:?}", c);
+                        println!("[camera {camera_idx}] Parsed FFmpeg configuration: {:?}", c);
                     }
                     FfmpegEvent::ParsedStreamMapping(mapping) => {
-                        println!("Parsed stream mapping: {}", mapping);
+                        println!("[camera {camera_idx}] Parsed stream mapping: {}", mapping);
                     }
                     FfmpegEvent::ParsedInput(input) => {
-                        println!("Parsed input: {:?}", input);
+                        println!("[camera {camera_idx}] Parsed input: {:?}", input);
                     }
                     FfmpegEvent::ParsedOutput(output) => {
-                        println!("Parsed output: {:?}", output);
+                        println!("[camera {camera_idx}] Parsed output: {:?}", output);
                     }
                     FfmpegEvent::ParsedInputStream(stream) => {
-                        println!("Parsed input stream: {:?}", stream);
+                        println!("[camera {camera_idx}] Parsed input stream: {:?}", stream);
                     }
                     FfmpegEvent::ParsedOutputStream(stream) => {
-                        println!("Parsed output stream: {:?}", stream);
+                        println!("[camera {camera_idx}] Parsed output stream: {:?}", stream);
                     }
                     FfmpegEvent::ParsedDuration(duration) => {
-                        println!("Parsed duration: {:?}", duration);
+                        println!("[camera {camera_idx}] Parsed duration: {:?}", duration);
                     }
                     FfmpegEvent::Log(level, msg) => {
-                        println!("FFmpeg log [{:?}]: {}", level, msg);
+                        println!("[camera {camera_idx}] FFmpeg log [{:?}]: {}", level, msg);
                     }
                     FfmpegEvent::LogEOF => {
-                        println!("FFmpeg log ended");
+                        println!("[camera {camera_idx}] FFmpeg log ended");
                     }
                     FfmpegEvent::Error(err) => {
-                        eprintln!("Error: {}", err);
+                        eprintln!("[camera {camera_idx}] Error: {}", err);
                     }
                     FfmpegEvent::Progress(progress) => {
-                        println!("Progress: {:?}", progress);
+                        println!("[camera {camera_idx}] Progress: {:?}", progress);
                     }
                     FfmpegEvent::OutputFrame(frame) => {
                         if frame.output_index != stream_index {
@@ -94,7 +95,7 @@ async fn spawn_ffmpeg_reader(rtsp_url: &str, stream_index: u32, sender: FrameSen
                         }
 
                         println!(
-                            "Received output frame: {}x{}, fmt={}, index={}, ts={}",
+                            "[camera {camera_idx}] Received output frame: {}x{}, fmt={}, index={}, ts={}",
                             frame.width,
                             frame.height,
                             frame.pix_fmt,
@@ -116,15 +117,15 @@ async fn spawn_ffmpeg_reader(rtsp_url: &str, stream_index: u32, sender: FrameSen
                         };
 
                         if sender.send(Some(rgb_image)).is_err() {
-                            eprintln!("Channel closed, stopping reader thread");
+                            eprintln!("[camera {camera_idx}] Channel closed, stopping reader thread");
                             break;
                         }
                     }
                     FfmpegEvent::OutputChunk(chunk) => {
-                        println!("Received output chunk ({} bytes)", chunk.len());
+                        println!("[camera {camera_idx}] Received output chunk ({} bytes)", chunk.len());
                     }
                     FfmpegEvent::Done => {
-                        println!("FFmpeg processing done");
+                        println!("[camera {camera_idx}] FFmpeg processing done");
                     }
                 }
             }
@@ -134,20 +135,14 @@ async fn spawn_ffmpeg_reader(rtsp_url: &str, stream_index: u32, sender: FrameSen
     Ok(())
 }
 
-/// Consumes new frames from the receiver and publishes them asynchronously.
-async fn publish_frames(mut receiver: FrameReceiver) -> Result<()> {
-    let publisher = make87::resolve_topic_name("CAMERA_RGB")
-        .and_then(|resolved| make87::get_publisher::<ImageRgb888>(resolved))
-        .expect("Failed to resolve or create publisher");
-
-    loop {
-        receiver.changed().await?;
-        if let Some(image) = receiver.borrow().clone() {
-            if let Err(e) = publisher.publish_async(&image).await {
-                eprintln!("Failed to publish frame: {e}");
-            }
-        }
-    }
+fn parse_csv<T: std::str::FromStr>(input: &str, field: &str) -> Result<Vec<T>, anyhow::Error>
+where
+    <T as std::str::FromStr>::Err: std::fmt::Display,
+{
+    input
+        .split(',')
+        .map(|s| s.trim().parse::<T>().map_err(|e| anyhow::anyhow!("Invalid value in {}: {}", field, e)))
+        .collect()
 }
 
 fn load_camera_config() -> Result<CameraConfig, anyhow::Error> {
@@ -157,21 +152,47 @@ fn load_camera_config() -> Result<CameraConfig, anyhow::Error> {
         .ok_or_else(|| anyhow::anyhow!("CAMERA_PASSWORD is required"))?;
     let ip = make87::get_config_value("CAMERA_IP")
         .ok_or_else(|| anyhow::anyhow!("CAMERA_IP is required"))?;
-
-    let port = make87::get_config_value("CAMERA_PORT").unwrap_or_else(|| "554".to_string()).parse::<u32>().map_err(|e| anyhow::anyhow!("STREAM_INDEX must be a valid u32: {}", e))?;
+    let port = make87::get_config_value("CAMERA_PORT").unwrap_or_else(|| "554".to_string());
     let uri_suffix = make87::get_config_value("CAMERA_URI_SUFFIX").unwrap_or_default();
-    let stream_index = make87::get_config_value("STREAM_INDEX")
-        .unwrap_or_else(|| "0".to_string())
-        .parse::<u32>()
-        .map_err(|e| anyhow::anyhow!("STREAM_INDEX must be a valid u32: {}", e))?;
+    let stream_index = make87::get_config_value("STREAM_INDEX").unwrap_or_else(|| "0".to_string());
+
+    let usernames = parse_csv::<String>(&username, "CAMERA_USERNAME")?;
+    let passwords = parse_csv::<String>(&password, "CAMERA_PASSWORD")?;
+    let ips = parse_csv::<String>(&ip, "CAMERA_IP")?;
+    let ports = parse_csv::<u32>(&port, "CAMERA_PORT")?;
+    let uri_suffixes = parse_csv::<String>(&uri_suffix, "CAMERA_URI_SUFFIX")?;
+    let stream_indices = parse_csv::<u32>(&stream_index, "STREAM_INDEX")?;
+
+    let config_fields = [
+        ("CAMERA_USERNAME", usernames.len()),
+        ("CAMERA_PASSWORD", passwords.len()),
+        ("CAMERA_IP", ips.len()),
+        ("CAMERA_PORT", ports.len()),
+        ("CAMERA_URI_SUFFIX", uri_suffixes.len()),
+        ("STREAM_INDEX", stream_indices.len()),
+    ];
+    let expected = config_fields.iter().map(|(_, l)| *l).max().unwrap_or(1);
+
+    if !config_fields.iter().all(|&(_, l)| l == expected) {
+        let details = config_fields
+            .iter()
+            .map(|(name, len)| format!("{}: {}", name, len))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(anyhow::anyhow!(
+            "All camera config fields must have the same number of comma-separated values.\nField lengths: {}\nExpected: {}",
+            details,
+            expected
+        ));
+    }
 
     Ok(CameraConfig {
-        username,
-        password,
-        ip,
-        port,
-        uri_suffix,
-        stream_index,
+        username: usernames,
+        password: passwords,
+        ip: ips,
+        port: ports,
+        uri_suffix: uri_suffixes,
+        stream_index: stream_indices,
     })
 }
 
@@ -179,23 +200,48 @@ fn load_camera_config() -> Result<CameraConfig, anyhow::Error> {
 async fn main() -> Result<()> {
     make87::initialize();
 
-
     let config = load_camera_config()?;
 
+    let publisher = make87::resolve_topic_name("CAMERA_RGB")
+        .and_then(|resolved| make87::get_publisher::<ImageRgb888>(resolved))
+        .expect("Failed to resolve or create publisher");
 
-    let rtsp_url = format!(
-        "rtsp://{}:{}@{}:{}/{}",
-        config.username,
-        config.password,
-        config.ip,
-        config.port,
-        config.uri_suffix
-    );
+    let mut receivers = Vec::new();
 
-    let (sender, receiver) = watch::channel(None);
+    for idx in 0..config.ip.len() {
+        let rtsp_url = format!(
+            "rtsp://{}:{}@{}:{}/{}",
+            config.username[idx],
+            config.password[idx],
+            config.ip[idx],
+            config.port[idx],
+            config.uri_suffix[idx]
+        );
+        let (sender, receiver) = watch::channel(None);
+        receivers.push(receiver);
+        // Spawn each ffmpeg reader, passing camera index
+        let stream_index = config.stream_index[idx];
+        tokio::spawn(spawn_ffmpeg_reader(rtsp_url.clone(), stream_index, sender, idx));
+    }
 
-    spawn_ffmpeg_reader(&rtsp_url, config.stream_index, sender).await?;
-    publish_frames(receiver).await?;
+    // Wrap all receivers as streams and select over them
+    let mut select_all = SelectAll::new();
+    for receiver in receivers {
+        select_all.push(WatchStream::new(receiver));
+    }
+
+    // Publish frames as they arrive from any camera
+    select_all
+        .filter_map(|maybe_image| async move { maybe_image })
+        .for_each(|image| {
+            let publisher = &publisher;
+            async move {
+                if let Err(e) = publisher.publish_async(&image).await {
+                    eprintln!("Failed to publish frame: {e}");
+                }
+            }
+        })
+        .await;
 
     Ok(())
 }

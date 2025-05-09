@@ -10,3 +10,5 @@ anyhow = "1.0.98"
 ffmpeg-sidecar = "2.0.5"
 tokio = "1.45.0"
 url = "2.5.4"
+futures = "0.3.31"
+tokio-stream = { version = "0.1.17", features = ["sync"] }

@@ -24,6 +24,8 @@ This app uses the following configuration values:
 | CAMERA_URI_SUFFIX  | No       | (empty) | Optional URI suffix (e.g., `stream1`, `live`) |
 | STREAM_INDEX       | No       | 0       | Stream index for multi-stream cameras         |
 
+You can add multiple cameras by using comma-separated values for every field.
+
 ## 📤 Output
 
 Each decoded frame is published as an `ImageRgb888` message on the `CAMERA_RGB` topic. The `Header` includes the current wallclock timestamp and the computed `entity_path`.
